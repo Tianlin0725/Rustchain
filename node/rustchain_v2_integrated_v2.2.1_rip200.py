@@ -2198,24 +2198,36 @@ def submit_attestation():
 
 @app.route('/epoch', methods=['GET'])
 def get_epoch():
-    """Get current epoch info"""
+    """Get current epoch info.
+    
+    Returns limited public information without authentication.
+    Sensitive financial data (epoch_pot, enrolled_miners) requires X-API-Key header.
+    """
+    key = request.headers.get("X-API-Key")
+    is_authenticated = key == ADMIN_KEY if key else False
+    
     slot = current_slot()
     epoch = slot_to_epoch(slot)
     epoch_gauge.set(epoch)
 
-    with sqlite3.connect(DB_PATH) as c:
-        enrolled = c.execute(
-            "SELECT COUNT(*) FROM epoch_enroll WHERE epoch = ?",
-            (epoch,)
-        ).fetchone()[0]
-
-    return jsonify({
+    # Base public response
+    response = {
         "epoch": epoch,
         "slot": slot,
-        "epoch_pot": PER_EPOCH_RTC,
-        "enrolled_miners": enrolled,
         "blocks_per_epoch": EPOCH_SLOTS
-    })
+    }
+    
+    # Only include sensitive financial data with authentication
+    if is_authenticated:
+        with sqlite3.connect(DB_PATH) as c:
+            enrolled = c.execute(
+                "SELECT COUNT(*) FROM epoch_enroll WHERE epoch = ?",
+                (epoch,)
+            ).fetchone()[0]
+        response["epoch_pot"] = PER_EPOCH_RTC
+        response["enrolled_miners"] = enrolled
+    
+    return jsonify(response)
 
 @app.route('/epoch/enroll', methods=['POST'])
 def enroll_epoch():
@@ -2852,6 +2864,21 @@ def admin_required(f):
         return f(*args, **kwargs)
     return decorated
 
+def public_endpoint(f):
+    """
+    Decorator for endpoints that are public but can return enhanced data with auth.
+    Without auth: returns with _is_admin = False
+    With valid API key: returns with _is_admin = True
+    """
+    from functools import wraps
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        key = request.headers.get("X-API-Key")
+        is_admin = key == ADMIN_KEY if key else False
+        request._is_admin = is_admin
+        return f(*args, **kwargs)
+    return decorated
+
 def _db():
     """Get database connection with row factory"""
     conn = sqlite3.connect(DB_PATH)
@@ -3157,10 +3184,17 @@ def api_nodes():
 
 
 @app.route("/api/miners", methods=["GET"])
+@public_endpoint()
 def api_miners():
-    """Return list of attested miners with their PoA details"""
+    """Return list of attested miners with their PoA details.
+    
+    Without authentication: returns sanitized data (no entropy_score, no first_attest)
+    With authentication (X-API-Key header): returns full data
+    """
     import time as _time
     now = int(_time.time())
+    is_authenticated = getattr(request, '_is_admin', False)
+    
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
@@ -3195,28 +3229,34 @@ def api_miners():
             else:
                 hw_type = "Unknown/Other"
 
-            # Best-effort: join time (first attestation) from history table if present.
-            first_attest = None
-            try:
-                row2 = c.execute(
-                    "SELECT MIN(ts_ok) AS first_ts FROM miner_attest_history WHERE miner = ?",
-                    (r["miner"],),
-                ).fetchone()
-                if row2 and row2[0]:
-                    first_attest = int(row2[0])
-            except Exception:
-                first_attest = None
-
-            miners.append({
+            # Base response (public)
+            miner_data = {
                 "miner": r["miner"],
                 "last_attest": r["ts_ok"],
-                "first_attest": first_attest,
                 "device_family": r["device_family"],
                 "device_arch": r["device_arch"],
-                "hardware_type": hw_type,  # Museum System classification
-                "entropy_score": r["entropy_score"] or 0.0,
+                "hardware_type": hw_type,
                 "antiquity_multiplier": mult
-            })
+            }
+            
+            # Only return sensitive data with authentication
+            if is_authenticated:
+                # Best-effort: join time (first attestation) from history table if present.
+                first_attest = None
+                try:
+                    row2 = c.execute(
+                        "SELECT MIN(ts_ok) AS first_ts FROM miner_attest_history WHERE miner = ?",
+                        (r["miner"],),
+                    ).fetchone()
+                    if row2 and row2[0]:
+                        first_attest = int(row2[0])
+                except Exception:
+                    first_attest = None
+                    
+                miner_data["first_attest"] = first_attest
+                miner_data["entropy_score"] = r["entropy_score"] or 0.0
+            
+            miners.append(miner_data)
     
     return jsonify(miners)
 
@@ -3715,7 +3755,15 @@ def api_rewards_epoch(epoch: int):
 
 @app.route('/wallet/balance', methods=['GET'])
 def api_wallet_balance():
-    """Get balance for a specific miner"""
+    """Get balance for a specific miner.
+    
+    Requires authentication via X-API-Key header.
+    """
+    # Check for API key
+    key = request.headers.get("X-API-Key")
+    if key != ADMIN_KEY:
+        return jsonify({"ok": False, "reason": "authentication_required", "message": "Provide X-API-Key header with valid admin key"}), 401
+    
     miner_id = request.args.get("miner_id", "").strip()
     if not miner_id:
         return jsonify({"ok": False, "error": "miner_id required"}), 400
